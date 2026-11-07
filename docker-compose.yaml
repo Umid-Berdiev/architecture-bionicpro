@@ -1,6 +1,49 @@
-version: '3.8'
+# BionicPRO sprint 9 stack.
+#
+#   keycloak (+ keycloak_db)   identity provider, realm reports-realm, PKCE enforced
+#   frontend                   React SPA on :3000
+#   reports-api                FastAPI resource server on :8000, reads the ClickHouse mart
+#   crm_db                     emulated CRM (PostgreSQL) on :5434
+#   telemetry_db + simulator   emulated prosthesis telemetry (PostgreSQL) on :5435
+#   clickhouse                 OLAP: raw layer + reports_mart + etl_watermark, HTTP :8123
+#   airflow-*  (+ airflow_db)  hourly ETL DAG bionicpro_reports_etl, UI on :8081 (admin / admin)
+
+x-airflow-common: &airflow-common
+  build: ./airflow
+  user: "50000:0"
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
+    AIRFLOW__WEBSERVER__SECRET_KEY: bionicpro-dev-only-secret
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+    # Source connections used by the DAG (PostgresHook conn ids crm_db / telemetry_db)
+    AIRFLOW_CONN_CRM_DB: postgresql://crm:crm@crm_db:5432/crm
+    AIRFLOW_CONN_TELEMETRY_DB: postgresql://telemetry:telemetry@telemetry_db:5432/telemetry
+    # Target OLAP
+    CLICKHOUSE_HOST: clickhouse
+    CLICKHOUSE_PORT: "8123"
+    CLICKHOUSE_USER: reports
+    CLICKHOUSE_PASSWORD: reports
+    CLICKHOUSE_DB: reports
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/tests:/opt/airflow/tests
+    - ./airflow/logs:/opt/airflow/logs
+  depends_on:
+    airflow_db:
+      condition: service_healthy
+    clickhouse:
+      condition: service_healthy
+    crm_db:
+      condition: service_healthy
+    telemetry_db:
+      condition: service_healthy
 
 services:
+  # ------------------------------------------------------------------ identity
   keycloak_db:
     image: postgres:14
     environment:
@@ -11,6 +54,7 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,7 +64,7 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-    command: 
+    command:
       - start-dev
       - --import-realm
     volumes:
@@ -29,6 +73,8 @@ services:
       - "8080:8080"
     depends_on:
       - keycloak_db
+
+  # ------------------------------------------------------------------ user-facing
   frontend:
     build:
       context: ./frontend
@@ -40,3 +86,143 @@ services:
       REACT_APP_KEYCLOAK_URL: http://localhost:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+
+  reports-api:
+    build: ./reports-api
+    ports:
+      - "8000:8000"
+    environment:
+      # Issuer as written into tokens by Keycloak (browser-facing URL); JWKS over the docker network.
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/reports-realm
+      KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/reports-realm/protocol/openid-connect/certs
+      KEYCLOAK_AUDIENCE: reports-api
+      REPORTS_REQUIRED_ROLE: prothetic_user
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_USER: reports
+      CLICKHOUSE_PASSWORD: reports
+      CLICKHOUSE_DB: reports
+      CORS_ORIGINS: http://localhost:3000
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------ sources (emulated)
+  crm_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: crm
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: crm
+    volumes:
+      - ./crm/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - crm-data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crm -d crm"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  telemetry_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: telemetry
+      POSTGRES_USER: telemetry
+      POSTGRES_PASSWORD: telemetry
+    volumes:
+      - ./telemetry/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - telemetry-data:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telemetry -d telemetry"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  telemetry_simulator:
+    build: ./telemetry/simulator
+    environment:
+      TELEMETRY_DSN: postgresql://telemetry:telemetry@telemetry_db:5432/telemetry
+      INTERVAL_SECONDS: "10"
+    depends_on:
+      telemetry_db:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------ OLAP
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_DB: reports
+      CLICKHOUSE_USER: reports
+      CLICKHOUSE_PASSWORD: reports
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - clickhouse-data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q Ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ------------------------------------------------------------------ ETL
+  airflow_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username admin --password admin --firstname Admin --lastname User \
+          --role Admin --email admin@example.com || true
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8081:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  crm-data:
+  telemetry-data:
+  clickhouse-data:
+  airflow-db-data:

@@ -1,0 +1,41 @@
+token claims: {'iss': 'http://localhost:8080/realms/reports-realm', 'aud': 'reports-api', 'sub': '00000000-0000-4000-8000-000000000301', 'preferred_username': 'prothetic1', 'azp': 'reports-frontend'} {'roles': ['prothetic_user']}
+
+### 1. no token -> 401
+HTTP 401
+{"detail":"authentication required"}
+
+### 2. garbage token -> 401
+HTTP 401
+{"detail":"invalid token: PyJWKClientError"}
+
+### 3. own user_id -> 200
+HTTP 200
+{"user":{"id":"00000000-0000-4000-8000-000000000301","username":"prothetic1","full_name":"Иванов Пётр Сергеевич"},"period":{"from":"2026-11-06","to":"2026-11-07","requested_to":"2026-11-07","clamped":false},"data_processed_until":"2026-11-07T19:00:00+00:00","generated_at":"2026-11-07T19:18:32.301735+00:00","summary":{"days":2,"prostheses":["BP-ARM-2024-0001"],"actions_count":717
+
+### 4. other user's id (prothetic2) -> 403
+HTTP 403
+{"detail":"a report is available only for your own account"}
+
+### 5. period entirely after processed_until -> 422
+HTTP 422
+{"detail":"data is processed only until 2026-11-07T19:00:00Z; requested period starts later","data_processed_until":"2026-11-07T19:00:00Z"}
+
+### 6. period ends after processed_until -> 200, clamped
+HTTP 200
+{"user":{"id":"00000000-0000-4000-8000-000000000301","username":"prothetic1","full_name":"Иванов Пётр Сергеевич"},"period":{"from":"2026-11-06","to":"2026-11-07","requested_to":"2026-11-30","clamped":true},"data_processed_until":"2026-11-07T19:00:00+00:00","generated_at":"2026-11-07T19:18:32.376027+00:00","summary":{"days":2,"prostheses":["BP-ARM-2024-0001"],"actions_count":717,
+
+### 7. csv -> text/csv
+HTTP/1.1 200 OK
+date: Sat, 07 Nov 2026 19:18:31 GMT
+server: uvicorn
+content-disposition: attachment; filename="bionicpro-report-prothetic1-2026-11-06-2026-11-07.csv"
+content-length: 461
+content-type: text/csv; charset=utf-8
+
+HTTP 200
+report_date,prosthesis_serial,model,side,actions_count,avg_reaction_ms,p95_reaction_ms,max_reaction_ms,slow_actions_count,avg_noise_level,avg_battery_pct,min_battery_pct,error_count,active_hours,partial
+2026-11-06,BP-ARM-2024-0001,BionicArm Pro 2,right,398,85.2336654663086,147,195,92,0.21641041338443756,52.5,5,3,24,False
+2026-11-07,BP-ARM-2024-0001,BionicArm Pro 2,right,319,83.17241668701172,156
+
+### 8. only own prosthesis serials in the default report
+serials: ['BP-ARM-2024-0001'] days: 7 processed_until: 2026-11-07T19:00:00+00:00 period: {'from': '2026-11-01', 'to': '2026-11-07', 'requested_to': '2026-11-07', 'clamped': False}
